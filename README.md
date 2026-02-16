@@ -6,4 +6,5 @@ Official website: https://neumeier-edv.de/automation-plattform
 
 # How to start...
 Official application for SAP Business One: https://automation.sapbusiness.one/
+
 Official application for Systemhaus.One: https://automation.systemhaus.one/
