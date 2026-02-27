@@ -1,18 +1,32 @@
+using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using Microsoft.Extensions.AI;
 using Microsoft.SemanticKernel.ChatCompletion;
 using s2industries.ZUGFeRD;
-using System;
-using System.Linq;
-using System.Threading.Tasks;
 
 namespace AiImportVendor
 {
     public static class ItemAiHelper
     {
+        private const double SupplierCatalogBoost = 0.50;
+        private const double BarcodeBoost = 0.50;
+        private const double BuyerIdBoost = 0.30;
+        private const double NameBoostHigh = 0.20;
+        private const double NameBoostMedium = 0.10;
+        private const double NameBoostLow = 0.05;
+        private const double NameSimilarityHighThreshold = 0.90;
+        private const double NameSimilarityMediumThreshold = 0.75;
+        private const double NameSimilarityLowThreshold = 0.50;
+        private const double CosineWeight = 0.70;
+        private const double AcceptanceThreshold = 0.85;
+        private const double AcceptanceFloor = 0.75;
+        private const double AcceptanceDelta = 0.10;
+
         /// <summary>
-        /// Gets the best matching SAP item code for a billing line via AI
+        /// Gets the best matching SAP item code for a billing line via AI.
         /// </summary>
         public static async Task<string> ResolveItemCodeAsync(
             TradeLineItem line,
@@ -23,223 +37,300 @@ namespace AiImportVendor
             string fallbackItemCode = "E10000",
             Func<string, Backend.Database.RequestStatus, Task>? logger = null)
         {
+            logger ??= static (_, _) => Task.CompletedTask;
+
             try
             {
-                //fallbacks before calculation
-                if(line == null)
+                if (!TryValidateInputs(line, items, itemEmbeddings, out var validationMessage))
                 {
-                    if(logger != null) await logger("❌ITM-Match failed → line == null", Backend.Database.RequestStatus.Warning);
-                    return fallbackItemCode;
-                }
-                if(items == null || items.Count == 0)
-                {
-                    if(logger != null) await logger("❌ITM-Match failed → items leer", Backend.Database.RequestStatus.Warning);
-                    return fallbackItemCode;
-                }
-                if(itemEmbeddings == null || itemEmbeddings.Count == 0)
-                {
-                    if(logger != null) await logger("❌ITM-Match failed → itemEmbeddings leer", Backend.Database.RequestStatus.Warning);
+                    await logger($"ITM-Match failed: {validationMessage}", Backend.Database.RequestStatus.Warning);
                     return fallbackItemCode;
                 }
 
-                //validate if item has corresponding embedding; fallback if not
-                var candidateItems = items
-                                        .Where(i => !string.IsNullOrWhiteSpace(i.ItemCode) && itemEmbeddings.ContainsKey(i.ItemCode!))
-                                        .ToList();
+                var candidateItems = GetCandidateItems(items, itemEmbeddings);
                 if (candidateItems.Count == 0)
                 {
-                    if (logger != null) await logger("❌ITM-Match failed → keine Kandidaten mit Embedding.", Backend.Database.RequestStatus.Warning);
+                    await logger("ITM-Match failed: no candidate items with embeddings.", Backend.Database.RequestStatus.Warning);
                     return fallbackItemCode;
                 }
 
-                //1)
-                //unique line values
-                var sellerIds   = GetSupplierIds(line);
-                var buyerId     = NormalizeId(line?.BuyerAssignedID);
-                var barcodes    = GetBarcodes(line);
-                var nameTokens  = NormalizeName(line?.Name ?? "");
+                var (sellerIds, buyerId, barcodes, nameTokens) = ExtractLineFeatures(line);
 
-                //2)
-                // create item embeddings
                 string lineSemantic = ToSemanticStringLine(line);
                 if (string.IsNullOrWhiteSpace(lineSemantic))
                 {
-                    lineSemantic = $"{line?.BuyerAssignedID} | {line?.SellerAssignedID} | {line?.Name}";
+                    lineSemantic = $"{line.BuyerAssignedID} | {line.SellerAssignedID} | {line.Name}";
                 }
 
                 await logger($"KI-ITM-Info: {lineSemantic}", Backend.Database.RequestStatus.Success);
                 var queryEmbedding = await embeddingService.GenerateAsync(lineSemantic);
-
                 var queryVector = queryEmbedding?.Vector.ToArray();
+
                 if (queryVector == null || queryVector.Length == 0)
                 {
-                    if (logger != null)
-                        await logger("❌ITM-Match failed → Querry Embedding leer → Fallback", Backend.Database.RequestStatus.Warning);
-                    
+                    await logger("ITM-Match failed: query embedding is empty. Using fallback.", Backend.Database.RequestStatus.Warning);
                     return fallbackItemCode;
                 }
 
-                //3)
-                //line score calculation
-                var scored = new List<(string ItemCode, double Score, string Reason)>();
-
-                foreach (var it in candidateItems)
-                {
-                    var code = it.ItemCode!;
-                    if (!itemEmbeddings.TryGetValue(code, out var emb) || emb?.Vector == null || emb.Vector.Length == 0)
-                        continue;
-
-                    double cosine = CosineSimilarity(queryVector, emb.Vector.ToArray());
-                    double boost = 0.0;
-                    var reasons = new List<string> { $"cos={cosine:F3}" };
-
-                    //Supplier-catalognumber and seller-IDs match (highscore)
-                    if (!string.IsNullOrWhiteSpace(it.SupplierCatalogNo) && sellerIds.Contains(NormalizeId(it.SupplierCatalogNo)))
-                    {
-                        boost += 0.50;
-                        reasons.Add("SupplierCatalogNr=match(+0.50)");
-                    }
-
-                    //Barcode/EAN match (highscore)
-                    if (!string.IsNullOrWhiteSpace(it.Barcode) && barcodes.Contains(NormalizeBarcode(it.Barcode)))
-                    {
-                        boost += 0.50;
-                        reasons.Add("Barcode=match(0.50)");
-                    }
-
-                    //BuyerAssignedID and ItemCode match (middle-score)
-                    if(!string.IsNullOrWhiteSpace(buyerId) && SameId(buyerId, it.ItemCode))
-                    {
-                        boost += 0.30;
-                        reasons.Add("BuyerId<>ItemCode=match(+0.30)");
-                    }
-
-                    //similar names (ItemName / ForeignName / GroupName) (low-middle score)
-                    double nameSimilar = Math.Max(
-                                                NameSimilarityIndex(nameTokens, NormalizeName(it.ItemName ?? "")), 
-                                                Math.Max(
-                                                    NameSimilarityIndex(nameTokens, NormalizeName(it.ForeignName ?? "")),
-                                                    NameSimilarityIndex(nameTokens, NormalizeName(it.ItemGroups?.GroupName ?? ""))
-                                                )
-                    );
-                    if (nameSimilar >= 0.9)
-                    {
-                        boost +=0.20;
-                        reasons.Add($"Name≈{nameSimilar:F2}(+0.20)");
-                    }
-                    else if (nameSimilar >= 0.75)
-                    {
-                        boost +=0.10;
-                        reasons.Add($"Name≈{nameSimilar:F2}(+0.10)");
-                    }
-                    else if (nameSimilar >= 0.5)
-                    {
-                        boost +=0.05;
-                        reasons.Add($"Name≈{nameSimilar:F2}(+0.05)");
-                    }
-
-                    //final score = 70% cosine + booster
-                    double final = Math.Min(1.0, (0.70 * cosine) + boost);
-                    scored.Add((code, final, string.Join(", ", reasons)));
-                }
-
-                //sort based on score
+                var scored = ScoreCandidates(candidateItems, itemEmbeddings, queryVector, sellerIds, buyerId, barcodes, nameTokens);
                 var ordered = scored.OrderByDescending(x => x.Score).ToList();
-                var best = ordered.FirstOrDefault();
-                var second = ordered.Skip(1).FirstOrDefault();
 
-                //4)
-                // threshholds; either highscore or clear difference to 2nd best
-                if (best.ItemCode != null)
+                if (TryResolveByScore(ordered, out var bestItemCode, out var bestScore, out var delta, out var bestReason))
                 {
-                    double delta = best.Score - (second.ItemCode == null ? 0 : second.Score);
-
-                    if (best.Score >= 0.85 || (best.Score >= 075 && delta >= 0.10))
-                    {
-                        if (logger != null) await logger($"✅ITM-Match success {best.ItemCode}: score={best.Score:F2} Δ= {delta:F2} [{best.Reason}]", Backend.Database.RequestStatus.Success);
-                        return best.ItemCode;
-                    }
+                    await logger(
+                        $"ITM-Match success {bestItemCode}: score={bestScore:F2} delta={delta:F2} [{bestReason}]",
+                        Backend.Database.RequestStatus.Success);
+                    return bestItemCode!;
                 }
 
-                //5)
-                //LLM-Fallback: Ask Ai for top 3
                 var top3 = ordered.Take(3).ToList();
-                if (top3.Count > 0)
+                var llmPick = await TryResolveByLlmAsync(top3, candidateItems, lineSemantic, fallbackItemCode, chatService);
+                if (!string.IsNullOrWhiteSpace(llmPick))
                 {
-                    //english for token efficiency and performance
-                    string prompt = $@"
-                        There is a billing line (semantic summary):
-                        ""{lineSemantic}""
-                        
-                        That are the 3 most similar articles from SAP (ItemCode | ItemName | ForeignName | Barcode | SupplierCatalogNr | Groupname):
-                        {string.Join("\n", top3.Select((m, i) => $"{i + 1}. {m.ItemCode}: {(candidateItems.First(itm => itm.ItemCode == m.ItemCode)).ToSemanticString()}"))}
-                        
-                        Only return the ItemCode of the single best match.
-                        If there is none, return '{fallbackItemCode}'.
-                        ";
-                    var llm = await chatService.GetChatMessageContentAsync(prompt);
-                    var pick = llm?.Content?.Trim();
-
-                    if (!string.IsNullOrWhiteSpace(pick))
-                    {
-                        if (logger != null)
-                        {
-                            await logger($@"✅ITM-Match (LLM) success → Pick: {pick}
-                                (Top3: {string.Join(">> ", top3.Select((t, i) => $"<< #{i + 1}: {(candidateItems.First(itm => itm.ItemCode == t.ItemCode)).ToSemanticString()}"))})",
-                                Backend.Database.RequestStatus.Success);
-                            return pick;
-                        }
-                    }
+                    await logger($"ITM-Match (LLM) success -> Pick: {llmPick}", Backend.Database.RequestStatus.Success);
+                    return llmPick;
                 }
 
-                //6)
-                //final fallback
-                if (logger != null) await logger("❌ITM-Match failed → Letzter Fallback verwendet.", Backend.Database.RequestStatus.Warning);
+                await logger("ITM-Match failed: using final fallback.", Backend.Database.RequestStatus.Warning);
                 return fallbackItemCode;
             }
             catch (Exception ex)
             {
-                if (logger != null) await logger($"❌ITM-Match Exception: {ex.GetType().Name}: {ex.Message}.", Backend.Database.RequestStatus.Warning);
+                await logger($"ITM-Match exception: {ex.GetType().Name}: {ex.Message}.", Backend.Database.RequestStatus.Warning);
                 return fallbackItemCode;
             }
         }
 
-        ///////////////////////////////////////////////////////// Help Methods //////////////////////////////////////////////////////////////
-        /// 
-        //help methods for readability (item information | ...)
+        private static bool TryValidateInputs(
+            TradeLineItem? line,
+            List<ItemVectorItem>? items,
+            Dictionary<string, Embedding<float>>? itemEmbeddings,
+            out string message)
+        {
+            if (line == null)
+            {
+                message = "line is null";
+                return false;
+            }
+
+            if (items == null || items.Count == 0)
+            {
+                message = "items are empty";
+                return false;
+            }
+
+            if (itemEmbeddings == null || itemEmbeddings.Count == 0)
+            {
+                message = "item embeddings are empty";
+                return false;
+            }
+
+            message = string.Empty;
+            return true;
+        }
+
+        private static List<ItemVectorItem> GetCandidateItems(
+            IEnumerable<ItemVectorItem> items,
+            IReadOnlyDictionary<string, Embedding<float>> itemEmbeddings)
+        {
+            return items
+                .Where(i => !string.IsNullOrWhiteSpace(i.ItemCode) && itemEmbeddings.ContainsKey(i.ItemCode!))
+                .ToList();
+        }
+
+        private static (HashSet<string> SellerIds, string? BuyerId, HashSet<string> Barcodes, string NameTokens) ExtractLineFeatures(
+            TradeLineItem line)
+        {
+            return (
+                GetSupplierIds(line),
+                NormalizeId(line.BuyerAssignedID),
+                GetBarcodes(line),
+                NormalizeName(line.Name) ?? string.Empty
+            );
+        }
+
+        private static List<(string ItemCode, double Score, string Reason)> ScoreCandidates(
+            IEnumerable<ItemVectorItem> candidateItems,
+            IReadOnlyDictionary<string, Embedding<float>> itemEmbeddings,
+            IReadOnlyList<float> queryVector,
+            IReadOnlySet<string> sellerIds,
+            string? buyerId,
+            IReadOnlySet<string> barcodes,
+            string nameTokens)
+        {
+            var scored = new List<(string ItemCode, double Score, string Reason)>();
+
+            foreach (var item in candidateItems)
+            {
+                var itemCode = item.ItemCode!;
+                if (!itemEmbeddings.TryGetValue(itemCode, out var embedding) || embedding?.Vector == null || embedding.Vector.Length == 0)
+                {
+                    continue;
+                }
+
+                double cosine = CosineSimilarity(queryVector, embedding.Vector.ToArray());
+                double boost = 0.0;
+                var reasons = new List<string> { $"cos={cosine:F3}" };
+
+                if (!string.IsNullOrWhiteSpace(item.SupplierCatalogNo) && sellerIds.Contains(NormalizeId(item.SupplierCatalogNo)!))
+                {
+                    boost += SupplierCatalogBoost;
+                    reasons.Add($"SupplierCatalogNo=match(+{SupplierCatalogBoost:F2})");
+                }
+
+                if (!string.IsNullOrWhiteSpace(item.Barcode) && barcodes.Contains(NormalizeBarcode(item.Barcode)!))
+                {
+                    boost += BarcodeBoost;
+                    reasons.Add($"Barcode=match(+{BarcodeBoost:F2})");
+                }
+
+                if (!string.IsNullOrWhiteSpace(buyerId) && SameId(buyerId, item.ItemCode))
+                {
+                    boost += BuyerIdBoost;
+                    reasons.Add($"BuyerId<>ItemCode=match(+{BuyerIdBoost:F2})");
+                }
+
+                double nameSimilarity = Math.Max(
+                    NameSimilarityIndex(nameTokens, NormalizeName(item.ItemName) ?? string.Empty),
+                    Math.Max(
+                        NameSimilarityIndex(nameTokens, NormalizeName(item.ForeignName) ?? string.Empty),
+                        NameSimilarityIndex(nameTokens, NormalizeName(item.ItemGroups?.GroupName) ?? string.Empty)
+                    )
+                );
+
+                if (nameSimilarity >= NameSimilarityHighThreshold)
+                {
+                    boost += NameBoostHigh;
+                    reasons.Add($"Name~{nameSimilarity:F2}(+{NameBoostHigh:F2})");
+                }
+                else if (nameSimilarity >= NameSimilarityMediumThreshold)
+                {
+                    boost += NameBoostMedium;
+                    reasons.Add($"Name~{nameSimilarity:F2}(+{NameBoostMedium:F2})");
+                }
+                else if (nameSimilarity >= NameSimilarityLowThreshold)
+                {
+                    boost += NameBoostLow;
+                    reasons.Add($"Name~{nameSimilarity:F2}(+{NameBoostLow:F2})");
+                }
+
+                double finalScore = Math.Min(1.0, (CosineWeight * cosine) + boost);
+                scored.Add((itemCode, finalScore, string.Join(", ", reasons)));
+            }
+
+            return scored;
+        }
+
+        private static bool TryResolveByScore(
+            IReadOnlyList<(string ItemCode, double Score, string Reason)> ordered,
+            out string? itemCode,
+            out double score,
+            out double delta,
+            out string? reason)
+        {
+            var best = ordered.FirstOrDefault();
+            var second = ordered.Skip(1).FirstOrDefault();
+
+            if (best.ItemCode == null)
+            {
+                itemCode = null;
+                score = 0;
+                delta = 0;
+                reason = null;
+                return false;
+            }
+
+            delta = best.Score - (second.ItemCode == null ? 0 : second.Score);
+            bool accepted = best.Score >= AcceptanceThreshold || (best.Score >= AcceptanceFloor && delta >= AcceptanceDelta);
+
+            itemCode = accepted ? best.ItemCode : null;
+            score = best.Score;
+            reason = best.Reason;
+            return accepted;
+        }
+
+        private static async Task<string?> TryResolveByLlmAsync(
+            IReadOnlyList<(string ItemCode, double Score, string Reason)> topCandidates,
+            IEnumerable<ItemVectorItem> candidateItems,
+            string lineSemantic,
+            string fallbackItemCode,
+            IChatCompletionService chatService)
+        {
+            if (topCandidates.Count == 0)
+            {
+                return null;
+            }
+
+            var candidateMap = candidateItems
+                .Where(i => !string.IsNullOrWhiteSpace(i.ItemCode))
+                .GroupBy(i => i.ItemCode!)
+                .ToDictionary(g => g.Key, g => g.First());
+
+            string topText = string.Join("\n", topCandidates.Select((candidate, index) =>
+            {
+                if (!candidateMap.TryGetValue(candidate.ItemCode, out var item))
+                {
+                    return $"{index + 1}. {candidate.ItemCode}";
+                }
+
+                return $"{index + 1}. {candidate.ItemCode}: {item.ToSemanticString()}";
+            }));
+
+            string prompt = $"""
+                There is a billing line (semantic summary):
+                "{lineSemantic}"
+
+                These are the 3 most similar SAP articles (ItemCode | ItemName | ForeignName | Barcode | SupplierCatalogNo | GroupName):
+                {topText}
+
+                Return only the ItemCode of the single best match.
+                If there is no suitable match, return '{fallbackItemCode}'.
+                """;
+
+            var llm = await chatService.GetChatMessageContentAsync(prompt);
+            var pick = llm?.Content?.Trim();
+
+            return string.IsNullOrWhiteSpace(pick) ? null : pick;
+        }
+
         private static string ToSemanticStringLine(TradeLineItem line)
         {
             var parts = new List<string>();
-            //item code
-            if (!string.IsNullOrWhiteSpace(line?.SellerAssignedID)) 
+            if (!string.IsNullOrWhiteSpace(line?.SellerAssignedID))
+            {
                 parts.Add($"ItemCode: {line.SellerAssignedID}");
+            }
 
-            //item name
             if (!string.IsNullOrWhiteSpace(line?.Name))
+            {
                 parts.Add($"Name: {line.Name}");
+            }
 
-            //foreign name
             var foreignName = line?.AssociatedDocument?.Notes?.FirstOrDefault()?.Content;
             if (!string.IsNullOrWhiteSpace(foreignName))
+            {
                 parts.Add($"Fremdname: {foreignName}");
+            }
 
-            //barcode
             var barcode = line?.DesignatedProductClassifications?.FirstOrDefault()?.ClassName;
             if (!string.IsNullOrWhiteSpace(barcode))
+            {
                 parts.Add($"Barcode: {barcode}");
+            }
 
-            //supplier nr.
             if (!string.IsNullOrWhiteSpace(line?.GlobalID?.ID))
+            {
                 parts.Add($"Lieferanten-Nr.: {line.GlobalID.ID}");
+            }
 
-            //product group
             if (!string.IsNullOrWhiteSpace(line?.BuyerAssignedID))
+            {
                 parts.Add($"Produktgruppe: {line.BuyerAssignedID}");
+            }
 
             return string.Join(" | ", parts);
         }
 
-        //item info help methods
         private static HashSet<string> GetSupplierIds(TradeLineItem line)
         {
             var set = new HashSet<string>(StringComparer.Ordinal);
@@ -249,7 +340,7 @@ namespace AiImportVendor
             }
             if (!string.IsNullOrWhiteSpace(line?.GlobalID?.ID))
             {
-                set.Add(NormalizeId(line?.GlobalID?.ID)!);
+                set.Add(NormalizeId(line.GlobalID.ID)!);
             }
             return set;
         }
@@ -257,52 +348,53 @@ namespace AiImportVendor
         private static HashSet<string> GetBarcodes(TradeLineItem line)
         {
             var set = new HashSet<string>(StringComparer.Ordinal);
-            var firstBc = line?.DesignatedProductClassifications?.FirstOrDefault()?.ClassName;
-            if (!string.IsNullOrWhiteSpace(firstBc))
+            var firstBarcode = line?.DesignatedProductClassifications?.FirstOrDefault()?.ClassName;
+            if (!string.IsNullOrWhiteSpace(firstBarcode))
             {
-                set.Add(NormalizeId(firstBc)!);
+                set.Add(NormalizeBarcode(firstBarcode)!);
             }
             return set;
         }
 
-        //clear text help methods
-        private static string? NormalizeId(string? s)
+        private static string? NormalizeId(string? value)
         {
-            if (string.IsNullOrWhiteSpace(s))
+            if (string.IsNullOrWhiteSpace(value))
+            {
                 return null;
+            }
 
-            s = s.Trim();
-            s = Regex.Replace(s, @"\s|-|\.", ""); //remove space/dots/dash
-            return s.ToUpperInvariant();
+            value = value.Trim();
+            value = Regex.Replace(value, @"\s|-|\.", string.Empty);
+            return value.ToUpperInvariant();
         }
 
-        private static string? NormalizeBarcode(string? s)
+        private static string? NormalizeBarcode(string? value)
         {
-            if (string.IsNullOrWhiteSpace(s))
+            if (string.IsNullOrWhiteSpace(value))
+            {
                 return null;
+            }
 
-            s = Regex.Replace(s, @"\s|-", ""); //only numbers and letters
-            return s.ToUpperInvariant();
+            value = Regex.Replace(value, @"\s|-", string.Empty);
+            return value.ToUpperInvariant();
         }
 
-        private static string? NormalizeName(string? s)
+        private static string? NormalizeName(string? value)
         {
-            s = (s ?? "").ToLowerInvariant();
-            s = Regex.Replace(s, @"[^\p{L}\p{N}\s]", " ");
-            s = Regex.Replace(s, @"\s+", " ").Trim(); 
-            return s;
+            value = (value ?? string.Empty).ToLowerInvariant();
+            value = Regex.Replace(value, @"[^\p{L}\p{N}\s]", " ");
+            value = Regex.Replace(value, @"\s+", " ").Trim();
+            return value;
         }
 
-        //compare help methods
-        private static bool SameId(string? a, string? b)
+        private static bool SameId(string? left, string? right)
         {
-            a = NormalizeId(a);
-            b = NormalizeId(b);
-            return !string.IsNullOrWhiteSpace(a) && a == b;
+            left = NormalizeId(left);
+            right = NormalizeId(right);
+            return !string.IsNullOrWhiteSpace(left) && left == right;
         }
 
-        //compares 2 values and returns 0< - >1
-        static double CosineSimilarity(IReadOnlyList<float> v1, IReadOnlyList<float> v2)
+        private static double CosineSimilarity(IReadOnlyList<float> v1, IReadOnlyList<float> v2)
         {
             double dot = 0;
             double n1 = 0;
@@ -311,40 +403,36 @@ namespace AiImportVendor
 
             for (int i = 0; i < length; i++)
             {
-                dot += v1[i] * v2[i]; 
-                n1  += v1[i] * v1[i];
-                n2  += v2[i] * v2[i];
+                dot += v1[i] * v2[i];
+                n1 += v1[i] * v1[i];
+                n2 += v2[i] * v2[i];
             }
 
             if (n1 == 0 || n2 == 0)
             {
                 return 0;
             }
-            else
-            {
-                return dot / (Math.Sqrt(n1) * Math.Sqrt(n2));
-            }
+
+            return dot / (Math.Sqrt(n1) * Math.Sqrt(n2));
         }
 
-        //Jaccard similarity index (value between 0 and 1)
-        static double NameSimilarityIndex(string a, string b)
+        private static double NameSimilarityIndex(string a, string b)
         {
-            var A = new HashSet<string>(a.Split(' ', StringSplitOptions.RemoveEmptyEntries));
-            var B = new HashSet<string>(b.Split(' ', StringSplitOptions.RemoveEmptyEntries));
-            if (A.Count == 0 && B.Count == 0)
+            var setA = new HashSet<string>(a.Split(' ', StringSplitOptions.RemoveEmptyEntries));
+            var setB = new HashSet<string>(b.Split(' ', StringSplitOptions.RemoveEmptyEntries));
+            if (setA.Count == 0 && setB.Count == 0)
+            {
                 return 1.0;
+            }
 
-            var inter = A.Intersect(B).Count();
-            var union = A.Union(B).Count();
-
+            int inter = setA.Intersect(setB).Count();
+            int union = setA.Union(setB).Count();
             if (union == 0)
             {
                 return 0;
             }
-            else
-            {
-                return (double)inter / union; //calculates the sum of same words in relation to the sum of different words
-            }
+
+            return (double)inter / union;
         }
     }
 }
